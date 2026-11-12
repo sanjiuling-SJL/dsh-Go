@@ -1,0 +1,266 @@
+--- a/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/runtime/DshProcess.kt
++++ b/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/runtime/DshProcess.kt
+@@ -84,7 +84,7 @@
+      * [binds] are extra proot `-b host:guest` mounts, inserted before the guest command.
+      * [safe] boots the rescue profile instead of `web` (see [SafeMode.profileArg]).
+      */
+-    fun start(guestEnv: Map<String, String>, binds: List<String> = emptyList(), safe: Boolean = false, phone: Boolean = false, directEngine: Boolean = false, directFailed: Boolean = false, searchOverlay: Boolean = false, authOverlay: Boolean = false, speechOverlay: Boolean = false, tawcEngine: Boolean = false, tawcFailed: Boolean = false, onLaunchMethod: ((Boolean) -> Unit)? = null) {
++    fun start(guestEnv: Map<String, String>, binds: List<String> = emptyList(), safe: Boolean = false, phone: Boolean = false, directEngine: Boolean = false, directFailed: Boolean = false, searchOverlay: Boolean = false, authOverlay: Boolean = false, speechOverlay: Boolean = false, tawcEngine: Boolean = false, tawcFailed: Boolean = false, rootEngine: Boolean = false, onLaunchMethod: ((Boolean) -> Unit)? = null) {
+         check(process == null) { "already started" }
+         // tawcroot wins over Direct when both are on; like Direct it needs PRoot's fake hard links gone.
+         val tawcWanted = tawcEngine && !safe
+@@ -98,6 +98,9 @@
+         if (tidy && cleanup.complete) selection = tidyLinks(binds)
+         tawc = tawcReady && selection.direct
+         direct = selection.direct && !tawcReady
++        // Root engine: only the plain PRoot path can be started through su; Direct/tawcroot keep
++        // their own loaders, and safe mode must stay reproducible.
++        val rootWanted = rootEngine && !safe && !direct && !tawc
+         directFallbackReason = selection.fallbackReason ?: when {
+             tawcWanted && tawcFailed -> TawcrootLaunch.FAILED
+             tawcMissing != null -> tawcMissing
+@@ -129,7 +132,8 @@
+         val argv = ArrayList<String>()
+         val sameBind = DirectLaunch.samePathBind(rootfs)
+         val launchArgv = DirectLaunch.prootArguments(rootfs, manifest.launchArgv, direct)
+-        val allBinds = binds.filterNot { expand(it) == sameBind }.distinct()
++        // Root engine exposes the phone's /data to the guest; entered only through su.
++        val allBinds = (binds + if (rootWanted) listOf("/data") else emptyList()).filterNot { expand(it) == sameBind }.distinct()
+         // PRoot's Node resolves through glibc, which fails A with a refused AAAA (#152): add Direct's resolver.
+         val effectiveGuestEnv = guestEnv + ("DSH_GO_RUNTIME_ROOT" to rootfs.canonicalPath) +
+             listOfNotNull(if (direct) null else "NODE_OPTIONS" to DirectLaunch.prootNodeOptions(guestEnv["NODE_OPTIONS"]))
+@@ -206,20 +210,36 @@
+             env.clear()
+             env.putAll(tawcPlan.environment)
+         }
++        val rootArgv = if (rootWanted && tawcPlan == null && !direct) rootWrapped(argv, env.toMap()) else null
++        if (rootArgv != null) {
++            builder.command(rootArgv)
++            listener.onLog("[dsh-app] root engine: launching PRoot through su, guest /data bound", "system")
++        }
+ 
+         readyReported = false
+         if (directFallbackReason == DirectLaunch.INCOMPATIBLE) listener.onLog("[dsh-app] direct fallback: proot hard-link backing files need compatible launch; user preference and data retained", "system")
+         if (directFallbackReason == DirectLaunch.FAILED) listener.onLog("[dsh-app] direct fallback: direct launch failed before with this runtime; turn Direct on again to retry", "system")
+         if (directFallbackReason == TawcrootLaunch.FAILED) listener.onLog("[dsh-app] tawcroot fallback: tawcroot failed to start before with this runtime; turn tawcroot on again to retry", "system")
+         listener.onLog("[dsh-app] launch method: ${if (tawc) "tawcroot" else if (direct) "direct-glibc" else "proot"}${if ((directEngine || tawcEngine) && safe) " (safe recovery)" else ""}", "system")
+-        listener.onLog("[dsh-app] launching ${builder.command().joinToString(" ") { redact(it) }}", "system")
++        // A root launch wraps the environment into the su script: never log that line's contents.
++        val launchLine = if (rootArgv != null) "su -c <root engine> ${redact(argv.joinToString(" "))}"
++            else builder.command().joinToString(" ") { redact(it) }
++        listener.onLog("[dsh-app] launching $launchLine", "system")
+         // stop() came in while this was being prepared: don't launch at all.
+         if (stopping) {
+             listener.onExit(this, 0, true)
+             return
+         }
+         onLaunchMethod?.invoke(direct)
+-        val p = builder.start()
++        val p = try {
++            builder.start()
++        } catch (e: IOException) {
++            // No su (or its authorization was withdrawn): keep the engine usable, without root.
++            if (rootArgv == null) throw e
++            listener.onLog("[dsh-app] root engine unavailable (${e.message}); starting without root", "system")
++            builder.command(argv)
++            builder.start()
++        }
+         process = p
+         launchDiagnostics.spawned()
+         val out = pump(p.inputStream.bufferedReader(), "stdout")
+@@ -542,3 +562,16 @@
+     val code = sync.waitFor()
+     if (code != 0) throw IOException("sync exited with $code")
+ }
++
++/** Single-quote a value for /system/bin/sh (KernelSU/Magisk/APatch su -c). */
++private fun shQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
++
++/**
++ * `su -c` receives one shell line: export the launch environment, then exec the original
++ * PRoot argv. Keeps the guest environment identical to a non-root start.
++ */
++private fun rootWrapped(argv: List<String>, env: Map<String, String>): List<String> {
++    val exports = env.entries.joinToString("; ") { (k, v) -> "export $k=${shQuote(v)}" }
++    val command = argv.joinToString(" ") { shQuote(it) }
++    return listOf("su", "-c", "$exports; exec $command")
++}
+--- a/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/runtime/RuntimeController.kt
++++ b/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/runtime/RuntimeController.kt
+@@ -150,6 +150,7 @@
+         "directEngineActive" to (process?.executionMode == "direct"),
+         "directEngineFallbackReason" to lastLaunch?.fallbackReason,
+         "tawcEngineEnabled" to tawcEngine().enabled,
++        "rootEngineEnabled" to rootEngine(),
+         "tawcEngineAvailable" to (tawcEngineUnavailable() == null),
+         "tawcEngineActive" to (process?.executionMode == "tawcroot"),
+         "currentExecutionMode" to process?.executionMode,
+@@ -171,6 +172,9 @@
+         failedRuntime = prefs.getString(K_TAWC_FAILED, null),
+         runtime = runCatching { manifest.runtimeVersion }.getOrNull(),
+     )
++    /** Opt-in: start PRoot through su so the guest is real root and sees /data. */
++    private fun rootEngine(): Boolean = prefs.getBoolean(K_ROOT_ENGINE, false)
++
+     private fun tawcEngineUnavailable(): String? =
+         TawcrootLaunch.unavailable(app.applicationInfo.nativeLibraryDir, android.os.Build.VERSION.SDK_INT)
+ 
+@@ -204,6 +208,30 @@
+         emitStatus()
+     }
+ 
++    /** Root engine is opt-in, off by default, and only meaningful for the PRoot launch. */
++    @Synchronized fun setRootEngine(enabled: Boolean) {
++        check(process == null && phase !in setOf(Phase.STARTING, Phase.RUNNING, Phase.STOPPING, Phase.INSTALLING) && !resetting) { "stop the engine before changing its launch method" }
++        val was = prefs.getBoolean(K_ROOT_ENGINE, false)
++        prefs.edit().putBoolean(K_ROOT_ENGINE, enabled).apply()
++        emitStatus()
++        // A root start leaves the guest's files owned by root; hand them back before the next
++        // ordinary start, or the app could no longer read its own runtime.
++        if (was && !enabled) repairRootOwnership()
++    }
++
++    private fun repairRootOwnership() {
++        worker.execute {
++            runCatching {
++                if (installer.installedVersion() == null) return@runCatching
++                val uid = android.os.Process.myUid()
++                val path = installer.rootfs.absolutePath
++                val quoted = "'" + path.replace("'", "'\\''") + "'"
++                ProcessBuilder("su", "-c", "chown -R $uid:$uid $quoted")
++                    .redirectErrorStream(true).start().waitFor()
++            }
++        }
++    }
++
+     /** Selects a separate workspace index for the next launch; never opens either index here. */
+     fun setWorkspaceRecovery(enabled: Boolean, onDone: (Throwable?) -> Unit) {
+         worker.execute {
+@@ -559,7 +587,7 @@
+                 val direct = directEngine()
+                 val tawc = tawcEngine()
+                 p.start(env, if (storage) PhoneStorage.binds() else emptyList(), safe, phone, direct.requested, direct.failed, searchOverlay, authOverlay, speechOverlay,
+-                    tawcEngine = tawc.saved == true, tawcFailed = tawc.failed) { actualDirect ->
++                    tawcEngine = tawc.saved == true, tawcFailed = tawc.failed, rootEngine = rootEngine()) { actualDirect ->
+                     // SafeMode.prepare writes its own briefing; leave the original home untouched.
+                     if (!safe) GuestSetup.writeAgentsMd(installer.rootfs, storage, phone, pendingVisualReplies, actualDirect)
+                 }
+@@ -1163,6 +1191,7 @@
+         private const val K_DIRECT_ENGINE = "directEngine"
+         /** Runtime version Direct failed to launch with (see [SafePolicy.directLaunchFailed]). */
+         private const val K_DIRECT_FAILED = "directEngineFailedRuntime"
++        private const val K_ROOT_ENGINE = "rootEngine"
+         private const val K_TAWC_ENGINE = "tawcEngine"
+         /** Runtime version tawcroot failed to start DSH with. */
+         private const val K_TAWC_FAILED = "tawcEngineFailedRuntime"
+--- a/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/runtime/RuntimePlugin.kt
++++ b/app/android/app/src/main/kotlin/io/github/ccch1mneyyy/dsh_app/runtime/RuntimePlugin.kt
+@@ -160,6 +160,14 @@
+                     result.error("launch_method_unavailable", error.message, null)
+                 }
+             }
++            "setRootEngine" -> {
++                try {
++                    controller.setRootEngine(call.argument<Boolean>("enabled") == true)
++                    result.success(null)
++                } catch (error: IllegalStateException) {
++                    result.error("launch_method_unavailable", error.message, null)
++                }
++            }
+             "setTawcEngine" -> {
+                 try {
+                     controller.setTawcEngine(call.argument<Boolean>("enabled") == true)
+--- a/app/lib/runtime/runtime_bridge.dart
++++ b/app/lib/runtime/runtime_bridge.dart
+@@ -170,6 +170,7 @@
+     this.tawcEngineEnabled = false,
+     this.tawcEngineAvailable = false,
+     this.tawcEngineActive = false,
++    this.rootEngineEnabled = false,
+     this.currentExecutionMode,
+     this.launchSelectedMode,
+     this.launchSpawned = false,
+@@ -232,6 +233,9 @@
+   final bool directEngineActive;
+   final String? directEngineFallbackReason;
+ 
++  /// The opt-in root launch (native PRoot through `su`); applies to the PRoot path only.
++  final bool rootEngineEnabled;
++
+   /// The opt-in tawcroot launch (native `TawcrootLaunch`); one of it and Direct is on at most.
+   final bool tawcEngineEnabled;
+   final bool tawcEngineAvailable;
+@@ -257,6 +261,7 @@
+     'tawcEngineEnabled': tawcEngineEnabled,
+     'tawcEngineAvailable': tawcEngineAvailable,
+     'tawcEngineActive': tawcEngineActive,
++    'rootEngineEnabled': rootEngineEnabled,
+     'currentExecutionMode': currentExecutionMode,
+     'launchSelectedMode': launchSelectedMode,
+     'launchSpawned': launchSpawned,
+@@ -313,6 +318,7 @@
+     tawcEngineEnabled: map['tawcEngineEnabled'] == true,
+     tawcEngineAvailable: map['tawcEngineAvailable'] == true,
+     tawcEngineActive: map['tawcEngineActive'] == true,
++    rootEngineEnabled: map['rootEngineEnabled'] == true,
+     currentExecutionMode: map['currentExecutionMode'] as String?,
+     launchSelectedMode: map['launchSelectedMode'] as String?,
+     launchSpawned: map['launchSpawned'] == true,
+@@ -633,6 +639,7 @@
+   /// Takes effect on the next start; native code rejects changes while active.
+   Future<void> setDirectEngine(bool enabled) => _methods.invokeMethod<void>('setDirectEngine', {'enabled': enabled});
+   Future<void> setTawcEngine(bool enabled) => _methods.invokeMethod<void>('setTawcEngine', {'enabled': enabled});
++  Future<void> setRootEngine(bool enabled) => _methods.invokeMethod<void>('setRootEngine', {'enabled': enabled});
+ 
+   /// Output around the last failure, tokens masked.
+   Future<List<String>> failureLog() async => (await _methods.invokeListMethod<String>('failureLog')) ?? const [];
+--- a/app/lib/ui/settings/direct_engine_settings.dart
++++ b/app/lib/ui/settings/direct_engine_settings.dart
+@@ -65,6 +65,16 @@
+         ? l10n.phoneDirectSafeHint
+         : l10n.phoneDirectHint;
+ 
++    final zh = Localizations.localeOf(context).languageCode == 'zh';
++    final rootEnabled =
++        runtime.loaded && stopped && !_saving && !status.directEngineEnabled && !status.tawcEngineEnabled;
++    final rootHint = !stopped
++        ? (zh ? '先停止引擎再切换' : 'Stop the engine first')
++        : (status.directEngineEnabled || status.tawcEngineEnabled)
++        ? (zh ? '仅支持 proot 启动方式' : 'PRoot launch only')
++        : (zh
++            ? '通过 su 以真实 root 运行 PRoot，并挂载 /data；引擎写入的文件会归 root 所有'
++            : 'Run PRoot as real root via su and bind /data; files it writes become root-owned');
+     return SettingsSection(
+       title: l10n.phoneDeveloperOptions,
+       children: [
+@@ -88,6 +98,12 @@
+           value: status.tawcEngineEnabled,
+           onChanged: tawcEnabled ? _changeTawc : null,
+         ),
++        SettingsSwitchTile(
++          title: zh ? 'Root 引擎（su）' : 'Root engine (su)',
++          subtitle: rootHint,
++          value: status.rootEngineEnabled,
++          onChanged: rootEnabled ? _changeRoot : null,
++        ),
+       ],
+     );
+   }
+@@ -99,6 +115,17 @@
+     } catch (_) {
+       if (mounted) showBriefNotice(context, context.l10n.phoneDirectChangeFailed);
+     } finally {
++      if (mounted) setState(() => _saving = false);
++    }
++  }
++
++  Future<void> _changeRoot(bool value) async {
++    setState(() => _saving = true);
++    try {
++      await ref.read(runtimeBridgeProvider).setRootEngine(value);
++    } catch (_) {
++      if (mounted) showBriefNotice(context, context.l10n.phoneDirectChangeFailed);
++    } finally {
+       if (mounted) setState(() => _saving = false);
+     }
+   }
