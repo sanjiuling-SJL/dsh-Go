@@ -1,0 +1,56 @@
+name: root-build3
+on:
+  push:
+    branches: [rootbuild]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.7'
+          channel: stable
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+      - name: Clone upstream
+        run: git clone --depth 1 https://github.com/ccch1mneyyy/dsh-Go.git src
+      - name: Apply patch
+        working-directory: src
+        run: git apply ../dsh-go-root-engine.patch
+      - name: Local properties
+        working-directory: src
+        run: printf 'sdk.dir=%s\nflutter.sdk=%s\n' "$ANDROID_HOME" "$FLUTTER_ROOT" > app/android/local.properties
+      - name: Gradle wrapper
+        run: |
+          mkdir -p "$RUNNER_TEMP/wrap"
+          cd "$RUNNER_TEMP/wrap"
+          gradle wrapper --gradle-version 9.3.1 --no-daemon
+          ls -la
+          cp -r gradle gradlew "$GITHUB_WORKSPACE/src/app/android/"
+      - name: Runtime
+        working-directory: src
+        run: bash runtime/build-runtime.sh arm64-v8a
+      - name: APK
+        working-directory: src/app
+        run: |
+          flutter pub get
+          cd ..
+          bash tooling/build-apk.sh -f arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-go-root
+          path: src/app/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
