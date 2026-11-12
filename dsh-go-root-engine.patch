@@ -275,3 +275,14 @@
  TALLOC_VERSION="2.5.0"
  SHMEM_VERSION="0.7"
  UBUNTU_EXTRA="${UBUNTU_EXTRA:-tzdata ca-certificates git}"   # extra noble debs (+ dependency closure)
+--- a/tooling/build-apk.sh
++++ b/tooling/build-apk.sh
+@@ -156,7 +156,7 @@
+ # libtawcroot.so for the opt-in tawcroot launch method, from the pinned tawc commit.
+ # Release builds must carry it; other builds go on without it (the option shows unavailable).
+ if ! python3 -I "$ROOT/runtime/tawcroot/build.py"; then
+-  [[ $mode == release ]] && die "tawcroot: libtawcroot.so did not build"
++  # Root build: tawcroot is optional; skip it instead of requiring the Android NDK.
+   rm -rf "$ROOT/runtime/out-tawcroot" # never package an older build's library
+   echo "build-apk: building without libtawcroot.so; the tawcroot launch option will be unavailable" >&2
+ fi
